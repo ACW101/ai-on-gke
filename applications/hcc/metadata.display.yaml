@@ -6,7 +6,7 @@ metadata:
     config.kubernetes.io/local-config: 'true'
 spec:
   info:
-    title: HyperCompute Cluster on GKE
+    title: AI-optimized GKE cluster using Cluster Director
     source:
       repo: https://github.com/GoogleCloudPlatform/ai-on-gke
       sourceType: git
@@ -89,7 +89,7 @@ spec:
             type: DISPLAY_VARIABLE_TOGGLE_TYPE_UNSPECIFIED
         a3_mega_consumption_model:
           name: a3_mega_consumption_model
-          title: Consumption options 
+          title: Consumption options
           section: required_config
           subtext: For optimal performance with distributed AI workloads, reserve densely allocated accelerator capacity. See <a href="https://cloud.google.com/ai-hypercomputer/docs/consumption-models"><i>Consumption options</i></a> for more details.</br>
           enumValueLabels:
@@ -139,9 +139,9 @@ spec:
           name: recipe
           title: Solution deployment option
           section: required_config
-          subtext: Select your deployment option. 
+          subtext: Select your deployment option.
           enumValueLabels:
-          - label: GKE Cluster Only 
+          - label: GKE Cluster Only
             value: gke
           - label: GKE Cluster with NCCL Test
             value: gke-nccl
@@ -283,8 +283,7 @@ spec:
       sections:
       - name: acknowledge
         title: Before you begin
-        subtext: This solution deploys a sample <a href="https://cloud.google.com/ai-hypercomputer/docs/create/gke-ai-hypercompute"><i>HyperCompute
-          Cluster</i></a> with GKE in your project to run AI/ML and HPC workloads.</br>
+        subtext: This solution deploys an AI-optimized GKE cluster in your project to run AI/ML and HPC workloads.
       - name: required_config
         title: Required configuration
     runtime:
