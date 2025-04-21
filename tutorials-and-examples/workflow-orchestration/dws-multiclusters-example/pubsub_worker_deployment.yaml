@@ -1,0 +1,238 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pubsub-processor
+  labels:
+    app: pubsub-processor
+    kueue.x-k8s.io/queue-name: dws-local-queue
+  annotations:
+    provreq.kueue.x-k8s.io/maxrundurationseconds: "600"
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  replicas: 2 # Adjust as needed
+  selector:
+    matchLabels:
+      app: pubsub-processor
+  template:
+    metadata:
+      labels:
+        app: pubsub-processor
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-tesla-t4"
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-queued"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+      - name: processor-script
+        image: python:3.10 # Use the specified python version
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Install dependencies first
+          echo "Installing google-cloud-pubsub..."
+          pip install --no-cache-dir google-cloud-pubsub
+
+          # Now define and run the Python script inline
+          echo "Starting Pub/Sub processing script..."
+          python -c '
+          # --- Start of Python Script ---
+          import time
+          from google.cloud import pubsub_v1
+          import os
+          import logging
+          import sys # For sys.exit
+
+          # --- Configuration (Read from Environment Variables) ---
+          PROJECT_ID = os.environ.get("PROJECT_ID")
+          SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID")
+          TOPIC_ID = os.environ.get("TOPIC_ID")
+          # Use .get with defaults for numeric types, converting from string safely
+          try:
+              INTERNAL_SLEEP_SECONDS = int(os.environ.get("INTERNAL_SLEEP_SECONDS", "5"))
+              CYCLE_INTERVAL_SECONDS = int(os.environ.get("CYCLE_INTERVAL_SECONDS", "10"))
+              MAX_MESSAGES_TO_PULL = int(os.environ.get("MAX_MESSAGES_TO_PULL", "1"))
+          except ValueError as e:
+              logging.error(f"Invalid numeric environment variable: {e}")
+              sys.exit(1)
+
+
+          # Basic validation for required variables
+          if not all([PROJECT_ID, SUBSCRIPTION_ID, TOPIC_ID]):
+              logging.error("Missing required environment variables: PROJECT_ID, SUBSCRIPTION_ID, TOPIC_ID")
+              sys.exit(1) # Exit if required env vars are missing
+
+          # Set up basic logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format="%(asctime)s - %(levelname)s - POD_NAME={} - %(message)s".format(os.environ.get("POD_NAME", "N/A"))
+          )
+
+          # --- Initialization ---
+          subscriber = None
+          publisher = None
+          subscription_path = None
+          topic_path = None
+          try:
+              subscriber = pubsub_v1.SubscriberClient()
+              publisher = pubsub_v1.PublisherClient()
+              subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)
+              topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
+
+              logging.info(f"Script configured for project: {PROJECT_ID}")
+              logging.info(f"Pulling from subscription: {subscription_path}")
+              logging.info(f"Publishing to topic: {topic_path}")
+              logging.info(f"Internal sleep duration (within cycle): {INTERNAL_SLEEP_SECONDS} seconds")
+              logging.info(f"Interval between cycles: {CYCLE_INTERVAL_SECONDS} seconds")
+              logging.info(f"Max messages per pull: {MAX_MESSAGES_TO_PULL}")
+
+          except Exception as e:
+              logging.error(f"Error during initialization: {e}", exc_info=True)
+              sys.exit(1) # Exit if clients cant be created
+
+          # --- Core Logic Function (One Cycle) ---
+          def run_one_cycle():
+              """Pulls, optionally sleeps internally, and publishes one message."""
+              pulled_message_data = None
+              ack_ids_to_ack = []
+              processed_successfully = False
+
+              # 1. Pull Message(s)
+              logging.info(f"Attempting to pull up to {MAX_MESSAGES_TO_PULL} message(s)...")
+              try:
+                  response = subscriber.pull(
+                      subscription=subscription_path,      # Pass subscription directly
+                      max_messages=MAX_MESSAGES_TO_PULL, # Pass max_messages directly
+                      return_immediately=True,             # Keep this keyword argument
+                      timeout=10.0                         # Keep this keyword argument
+                  )
+
+                  if not response.received_messages:
+                      logging.warning("No messages received from the subscription this cycle.")
+                      # No message pulled, but allow cycle to complete and publish a status
+                      processed_successfully = True
+
+                  else:
+                      logging.info(f"Received {len(response.received_messages)} message(s). Processing the first one.")
+                      received_message = response.received_messages[0]
+                      print(f"Received message: {received_message}")
+                      pulled_message_data = received_message.message.data
+                      ack_id = received_message.ack_id
+
+                      logging.info(f"  - Message ID: {received_message.message.message_id}")
+                      try:
+                          logging.info(f"  - Data (UTF-8 Decoded): {pulled_message_data.decode()}")
+                      except UnicodeDecodeError:
+                           logging.warning(f"  - Data: (Could not decode as UTF-8) {pulled_message_data!r}") # Use !r for raw bytes repr
+
+                      # Store ack_id for later, conditional acknowledgement
+                      ack_ids_to_ack.append(ack_id)
+
+              except Exception as e:
+                  logging.error(f"Error pulling message: {e}", exc_info=True)
+                  # Do not proceed with this cycle if pull failed
+                  return
+
+              # 2. Internal Sleep (Optional)
+              if INTERNAL_SLEEP_SECONDS > 0:
+                  logging.info(f"Sleeping internally for {INTERNAL_SLEEP_SECONDS} seconds...")
+                  time.sleep(INTERNAL_SLEEP_SECONDS)
+                  logging.info("Internal sleep finished.")
+
+              # 3. Publish Message
+              current_time = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+              if pulled_message_data:
+                  try:
+                      original_data_str = pulled_message_data.decode()
+                      data_to_publish_str = f"Processed msg from {SUBSCRIPTION_ID} at {current_time}. Original data snippet: {original_data_str[:50]}"
+                  except UnicodeDecodeError:
+                       data_to_publish_str = f"Processed msg (non-utf8 data) from {SUBSCRIPTION_ID} at {current_time}."
+              else:
+                  logging.info(f"No message pulled from {SUBSCRIPTION_ID} during cycle ending {current_time}.")
+                  return
+
+              data_to_publish_bytes = data_to_publish_str.encode()
+
+              logging.info(f"Attempting to publish message to topic: {topic_path}")
+              try:
+                  future = publisher.publish(topic_path, data_to_publish_bytes)
+                  message_id = future.result(timeout=30) # Wait max 30s for publish confirmation
+                  logging.info(f"Successfully published message with ID: {message_id}")
+                  # logging.info(f"  - Published Data: {data_to_publish_str}") # Optional: Log published data
+                  processed_successfully = True # Mark as successful *after* publish confirmation
+
+              except Exception as e:
+                  logging.error(f"Error publishing message: {e}", exc_info=True)
+                  processed_successfully = False
+
+              # 4. Acknowledge (conditionally)
+              if ack_ids_to_ack and processed_successfully:
+                  try:
+                      subscriber.acknowledge(request={"subscription": subscription_path, "ack_ids": ack_ids_to_ack})
+                      logging.info(f"Acknowledged received message(s) with ack_id(s): {ack_ids_to_ack}")
+                  except Exception as e:
+                       logging.error(f"Error acknowledging message(s) {ack_ids_to_ack}: {e}", exc_info=True)
+              elif ack_ids_to_ack and not processed_successfully:
+                  logging.warning(f"Processing/publishing failed. NOT acknowledging message(s) {ack_ids_to_ack}. They may be redelivered.")
+
+
+          # --- Main Execution Loop ---
+          try:
+              logging.info("Starting continuous processing loop.")
+              while True:
+                  logging.info("--- Starting new cycle ---")
+                  run_one_cycle() # Execute one pull-sleep-publish cycle
+                  logging.info(f"--- Cycle complete. Waiting for {CYCLE_INTERVAL_SECONDS} seconds before next cycle ---")
+                  time.sleep(CYCLE_INTERVAL_SECONDS) # Wait before starting the next cycle
+
+          except KeyboardInterrupt:
+              # Kubernetes sends SIGTERM on pod deletion, which Python catches as KeyboardInterrupt
+              logging.info("KeyboardInterrupt/SIGTERM received. Shutting down gracefully.")
+          except Exception as e:
+              # Catch any unexpected errors in the main loop itself
+              logging.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
+          finally:
+              # Optional: Clean up resources if needed (clients often manage this)
+              # if subscriber: subscriber.close()
+              # if publisher: publisher.close()
+              logging.info("Script finished.")
+              sys.exit(0) # Ensure clean exit code on graceful shutdown
+          # --- End of Python Script ---
+          ' # Closing single quote for python -c argument
+        env:
+          # --- Required Configuration ---
+          - name: PROJECT_ID
+            value: "CHANGE_ME" # <-- REPLACE THIS
+          - name: SUBSCRIPTION_ID # the subscription the worker is pulling from
+            value: "subscription-1" # <-- REPLACE THIS
+          - name: TOPIC_ID # the topic the worker is publishing to
+            value: "topic-2" # <-- REPLACE THIS
+          # --- Optional Configuration ---
+          - name: INTERNAL_SLEEP_SECONDS
+            value: "5"   # Default: 5 seconds
+          - name: CYCLE_INTERVAL_SECONDS
+            value: "10"  # Default: 10 seconds
+          - name: MAX_MESSAGES_TO_PULL
+            value: "1"   # Default: 1 message
+          # Add Pod Name to logs (useful when running multiple replicas)
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m" # 100 millicores (0.1 CPU)
+            nvidia.com/gpu: 1
+          limits:
+            memory: "256Mi"
+            cpu: "250m" # 250 millicores (0.25 CPU)
+            nvidia.com/gpu: 1
